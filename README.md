@@ -18,3 +18,8 @@ Edit `[Project]/Packages/manifest.json`
   }
 }
 ~~~
+
+Bistro
+
+获取Bistro资产：https://developer.nvidia.com/orca/amazon-lumberyard-bistro
+解压压缩包为一个目录，直接将目录拖入Unity即可导入
