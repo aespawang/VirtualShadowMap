@@ -1,0 +1,14 @@
+{
+  "name": "com.shadow.vsm",
+  "version": "0.0.0",
+  "displayName": "Virtual Shadow Maps",
+  "description": "Virtual Shadow Maps",
+  "unity": "2022.3",
+  "unityRelease": "50f1",
+  "documentationUrl": "https://github.com/ChenJiaming5613/VirtualShadowMaps/wiki",
+  "dependencies": {
+    "com.unity.render-pipelines.core": "14.0.11",
+    "com.unity.render-pipelines.universal": "14.0.11",
+    "com.unity.mathematics": "1.2.6"
+  }
+}

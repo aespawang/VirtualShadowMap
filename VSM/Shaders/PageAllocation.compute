@@ -1,0 +1,187 @@
+#pragma kernel ClearPhyStatus
+#pragma kernel MarkCacheHits
+#pragma kernel AllocatePages
+
+static const int VIR_PAGE_STATUS_UNLOADED = 0;
+static const int VIR_PAGE_STATUS_LOADED   = 1;
+static const int VIR_PAGE_STATUS_INDIRECT = 2;
+
+static const int PHY_PAGE_STATUS_FREE     = 0;
+static const int PHY_PAGE_STATUS_USED     = 1;
+
+struct PhyPageLoc
+{
+    int X;
+    int Y;
+};
+
+struct VirPageLoc
+{
+    int X;
+    int Y;
+    int Mip;
+};
+
+struct VirPageStatus
+{
+    PhyPageLoc PhyPageLoc;
+    int  Status;      // 0 = Unloaded, 1 = Loaded, 2 = Indirect
+    int  AncestorMip;
+};
+
+struct PhyPageStatus
+{
+    int VirPageIdx;
+    int Status;       // 0 = Free, 1 = Used
+};
+
+struct PageRequest
+{
+    VirPageLoc VirPageLoc;
+    PhyPageLoc PhyPageLoc;
+};
+
+// Buffers
+StructuredBuffer<int> _PageCountBuffer;
+RWStructuredBuffer<VirPageStatus> _VirPageStatus;
+RWStructuredBuffer<PhyPageStatus> _PhyPageStatus;
+AppendStructuredBuffer<PageRequest> _PageRequests;
+RWStructuredBuffer<uint> _NextPhyPageIndex;
+
+// Uniforms
+int _TotalVirPages;
+int _TotalPhyPages;
+int _RootPhyIdx;
+int _RootVirIdx;
+int _MipCount;
+int2 _VSMVirtualGridSize;
+int2 _VSMPhysicalGridSize;
+
+VirPageLoc GetVirPageLoc(int virIdx)
+{
+    int layerSize = _VSMVirtualGridSize.x * _VSMVirtualGridSize.y;
+    int mip = virIdx / layerSize;
+    int idxInLayer = virIdx % layerSize;
+    
+    VirPageLoc loc;
+    loc.X = idxInLayer % _VSMVirtualGridSize.x;
+    loc.Y = idxInLayer / _VSMVirtualGridSize.x;
+    loc.Mip = mip;
+    return loc;
+}
+
+PhyPageLoc GetPhyPageLoc(int phyIdx)
+{
+    PhyPageLoc phyLoc;
+    phyLoc.X = phyIdx % _VSMPhysicalGridSize.x;
+    phyLoc.Y = phyIdx / _VSMPhysicalGridSize.x;
+    return phyLoc;
+}
+
+[numthreads(64,1,1)]
+void ClearPhyStatus (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= (uint)_TotalPhyPages || idx == (uint)_RootPhyIdx) return;
+    _PhyPageStatus[idx].Status = PHY_PAGE_STATUS_FREE;
+}
+
+[numthreads(64,1,1)]
+void MarkCacheHits (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= (uint)_TotalVirPages) return;
+
+    int virIdx = (int)idx;
+    // Required page = root OR requested this frame.
+    if (!(virIdx == _RootVirIdx || _PageCountBuffer[virIdx] > 0)) return;
+
+    if (_VirPageStatus[virIdx].Status != VIR_PAGE_STATUS_LOADED) return;
+
+    PhyPageLoc phyLoc = _VirPageStatus[virIdx].PhyPageLoc;
+    int phyIdx = phyLoc.Y * _VSMPhysicalGridSize.x + phyLoc.X;
+
+    if (_PhyPageStatus[phyIdx].VirPageIdx == virIdx)
+    {
+        int placeHolder;
+        InterlockedExchange(_PhyPageStatus[phyIdx].Status, PHY_PAGE_STATUS_USED, placeHolder);
+    }
+    else
+    {
+        _VirPageStatus[virIdx].Status = VIR_PAGE_STATUS_UNLOADED;
+        PhyPageLoc invalidLoc = { -1, -1 };
+        _VirPageStatus[virIdx].PhyPageLoc = invalidLoc;
+    }
+}
+
+[numthreads(64,1,1)]
+void AllocatePages (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= (uint)_TotalVirPages) return;
+
+    int virIdx = (int)idx;
+    bool isRoot = (virIdx == _RootVirIdx);
+
+    // Skip non-required pages and already-loaded pages.
+    if (_VirPageStatus[virIdx].Status == VIR_PAGE_STATUS_LOADED || (!isRoot && _PageCountBuffer[virIdx] <= 0))
+        return;
+
+    int allocatedIdx = -1;
+    
+    if (isRoot)
+    {
+        allocatedIdx = _RootPhyIdx;
+        _PhyPageStatus[allocatedIdx].Status = PHY_PAGE_STATUS_USED;
+        _PhyPageStatus[allocatedIdx].VirPageIdx = virIdx;
+    }
+    else
+    {
+        uint totalPhy = (uint)_TotalPhyPages;
+        for (uint i = 0; i < totalPhy; ++i)
+        {
+            uint counter;
+            InterlockedAdd(_NextPhyPageIndex[0], 1, counter);
+            
+            // change index to [1, TotalPhyPages - 1]
+            int tryIdx = (int)((counter % (totalPhy - 1)) + 1);
+            
+            int oldStatus;
+            InterlockedCompareExchange(_PhyPageStatus[tryIdx].Status, PHY_PAGE_STATUS_FREE, PHY_PAGE_STATUS_USED, oldStatus);
+            
+            if (oldStatus == PHY_PAGE_STATUS_FREE)
+            {
+                allocatedIdx = tryIdx;
+                int oldVirIdx = _PhyPageStatus[allocatedIdx].VirPageIdx;
+                if (oldVirIdx != -1 && oldVirIdx != virIdx)
+                {
+                    _VirPageStatus[oldVirIdx].Status = VIR_PAGE_STATUS_UNLOADED;
+                    PhyPageLoc invalidLoc = { -1, -1 };
+                    _VirPageStatus[oldVirIdx].PhyPageLoc = invalidLoc;
+                }
+                
+                _PhyPageStatus[allocatedIdx].VirPageIdx = virIdx;
+                break;
+            }
+        }
+    }
+
+    if (allocatedIdx == -1)
+    {
+        _VirPageStatus[virIdx].PhyPageLoc = GetPhyPageLoc(_RootPhyIdx);
+        _VirPageStatus[virIdx].Status = VIR_PAGE_STATUS_INDIRECT;
+        _VirPageStatus[virIdx].AncestorMip = _MipCount - 1;
+    }
+    else
+    {
+        PhyPageLoc phyLoc = GetPhyPageLoc(allocatedIdx);
+        _VirPageStatus[virIdx].PhyPageLoc = phyLoc;
+        _VirPageStatus[virIdx].Status = VIR_PAGE_STATUS_LOADED;
+        _VirPageStatus[virIdx].AncestorMip = -1;
+
+        PageRequest req;
+        req.VirPageLoc = GetVirPageLoc(virIdx);
+        req.PhyPageLoc = phyLoc;
+        _PageRequests.Append(req);
+    }
+}

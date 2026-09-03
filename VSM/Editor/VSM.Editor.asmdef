@@ -1,0 +1,17 @@
+{
+    "name": "VSM.Editor",
+    "rootNamespace": "",
+    "references": [
+        "GUID:ea6520a21ec8bf7449585665c0f739e1",
+        "GUID:6055be8ebefd69e48b49212b09b47b2f"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

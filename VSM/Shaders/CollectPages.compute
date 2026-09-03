@@ -1,0 +1,75 @@
+﻿#pragma kernel ClearPageCount
+#pragma kernel CollectPages
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
+
+float4x4 _VSMLightMatrix;
+int2 _PageTableSize;
+float4 _VSMScreenSize;
+uint _TotalPageCount;
+uint _VSMMipCount;
+float _VSMDistanceSensitivity;
+float4 _VSMMainCameraWorldPos;
+
+RWStructuredBuffer<int> _VSMPageCountBuffer; // 每个 page 的像素数量
+RWTexture2D<float4> _CollectPageDebugTexture;
+
+[numthreads(64, 1, 1)]
+void ClearPageCount(uint3 vId : SV_DispatchThreadID)
+{
+    if (vId.x >= _TotalPageCount) return;
+    _VSMPageCountBuffer[vId.x] = 0;
+}
+
+[numthreads(8,8,1)]
+void CollectPages(uint3 vId : SV_DispatchThreadID)
+{
+    uint2 screenSize = (uint2)_VSMScreenSize.xy;
+    if (vId.x >= screenSize.x || vId.y >= screenSize.y) return;
+
+    _CollectPageDebugTexture[vId.xy] = float4(0, 0, 0, 1);
+
+    // 1. 获取屏幕 UV 和深度
+    float2 uv = vId.xy / _VSMScreenSize.xy;
+    float depth = LOAD_TEXTURE2D_X(_CameraDepthTexture, vId.xy).r;
+    if (depth <= 0.0) return;
+
+    // 2. 像素坐标还原世界坐标
+    float3 worldPos = ComputeWorldSpacePosition(uv, depth, UNITY_MATRIX_I_VP);
+
+    // 3. 计算 MipLevel
+    float dist = distance(worldPos, _VSMMainCameraWorldPos.xyz);
+    int mipLevel = floor(log2(max(dist, 0.001)) * _VSMDistanceSensitivity);
+    mipLevel = clamp(mipLevel, 0, (int)_VSMMipCount - 1);
+    
+    //4. 转换到光照空间
+    float4 lightClipPos = mul(_VSMLightMatrix, float4(worldPos, 1.0));
+    float3 lightNdc = lightClipPos.xyz / lightClipPos.w;
+
+    // 5. 计算虚拟纹理坐标 检查是否在光照盒子内
+    float2 lightUV = lightNdc.xy * 0.5 + 0.5; // 将 XY 从 [-1,1] 映射到 [0,1]
+    if (lightNdc.z < 0 || lightNdc.z > 1) return;
+    if (lightUV.x < 0 || lightUV.x > 1 || lightUV.y < 0 || lightUV.y > 1) return;
+
+    // 6. 计算页面坐标 (Page Coord)
+    int2 lightGridSize = max(int2(1, 1), _PageTableSize.xy >> mipLevel);
+    int virPageX = floor(lightUV.x * lightGridSize.x);
+    int virPageY = floor(lightUV.y * lightGridSize.y);
+    virPageX = clamp(virPageX, 0, lightGridSize.x - 1);
+    virPageY = clamp(virPageY, 0, lightGridSize.y - 1);
+
+    // 7. 写入 Buffer (pageIndex = row * numColumns + column), 原子 +1
+    int virPagesPerMipLayer = _PageTableSize.x * _PageTableSize.y;
+    int mipOffset = mipLevel * virPagesPerMipLayer;
+    int virPageIndexInLayer = virPageY * _PageTableSize.x + virPageX;
+    int virPageIndex = mipOffset + virPageIndexInLayer;
+    InterlockedAdd(_VSMPageCountBuffer[virPageIndex], 1);
+
+    _CollectPageDebugTexture[vId.xy] = float4(
+        (virPageX + 1) * 1.0 / lightGridSize.x,
+        (virPageY + 1) * 1.0 / lightGridSize.y,
+        0.0,
+        1.0
+    );
+}
